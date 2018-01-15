@@ -1,0 +1,165 @@
+#!/usr/bin/env python
+
+import getopt
+import requests
+import sys
+
+SHORT_OPTIONS = "hH:p:Csc:"
+LONG_OPTIONS = [
+    "help",
+    "host=",
+    "port=",
+    "check-cluster",
+    "ssl",
+    "ca-cert=",
+]
+
+# Nagios exit codes
+OK = 0
+WARNING = 1
+CRITICAL = 2
+UNKNOWN = 3
+
+
+def usage():
+    """
+    Show usage information.
+    :return: None
+    """
+    print("""Usage: %s [-h] [-H <host>] [-p <port>] [-s] [-c <ca_cert>]
+
+  -H <host>			Host name or IP address to connect to.
+  --host=<host>			Default: localhost
+
+  -c <ca_cert>			File or directory containing CA certificate if SSL is used.
+  --ca-cert=<ca_cert>		If ca_cert is a directory it must be have been processed using the c_rehash
+                                utility of OpenSSL.
+
+  -h				This text.
+  --help
+
+  -p <port>			Port to connect to.
+  --port=9200			Default: 9200
+
+  -s				Use SSL (HTTPS) instead of plain HTTP.
+  --ssl
+
+""" % (sys.argv[0]))
+
+
+def get_cluster_health(es_host, es_port, es_ssl, es_ca=None):
+    """
+    Query cluster health
+    :param es_host: hostname
+    :param es_port: port
+    :param es_ssl: use SSL
+    :param es_ca: file or directory containing root certificate(s)
+    :return: dictionary of state
+    """
+    result = {}
+
+    try:
+        if es_ssl:
+            if es_ca is not None:
+                es_req = requests.get("https://%s:%u/_cat/health?v" % (es_host, es_port), verify=es_ca)
+            else:
+                es_req = requests.get("https://%s:%u/_cat/health?v" % (es_host, es_port), verify=False)
+        else:
+            es_req = requests.get("http://%s:%u/_cat/health?v" % (es_host, es_port))
+
+        if not es_req.ok:
+            print("CRITICAL - Request to %s:%s (SSL: %s) returned with %u - %s" %
+                  (es_host, str(es_port), str(es_ssl), es_req.status_code, es_req.reason))
+            sys.exit(CRITICAL)
+
+        es_reply = es_req.text
+    except requests.exceptions.RequestException as err:
+        print("CRITICAL - Can't connect to elastic search at %s:%s (SSL: %s): %s\n" %
+              (es_host, str(es_port), str(es_ssl), err.message))
+        sys.exit(CRITICAL)
+
+    es_data = es_reply.split("\n")
+
+    # first line contains keys
+    indices = es_data[0].split()
+    data = es_data[1].split()
+    for i in range(len(indices)):
+        key = indices[i]
+        value = data[i]
+        result[key] = value
+
+    return result
+
+
+def parse_cluster_health(es_status):
+    """
+    Parse status dictionary.
+    :param es_status: status dictionary
+    :return: set of state, message
+    """
+    if "status" in es_status:
+        perf_data_array = []
+        cluster = es_status["cluster"]
+        parsed_status = es_status["status"]
+        status_keys = es_status.keys()
+        for skey in status_keys:
+            if skey not in ("cluster", "status", "epoch", "timestamp"):
+		if es_status[skey] == "-":
+                    es_status[skey] = 0
+
+                perf_data_array.append("%s=%s" % (skey, es_status[skey]))
+
+        perf_data = " ".join(perf_data_array)
+        if parsed_status == "red":
+            return CRITICAL, "CRITICAL - Cluster %s is in a critical condition|%s" % (cluster, perf_data)
+        elif parsed_status == "yellow":
+            return WARNING, "WARNING - Cluster %s is in a warning condition|%s" % (cluster, perf_data)
+        else:
+            return OK, "OK - Cluster %s is in a healthy condition|%s" % (cluster, perf_data)
+    else:
+        return "UNKNOWN", "Invalid result"
+
+
+if __name__ == "__main__":
+    check_cluster = True
+    port = 9200
+    host = "localhost"
+    use_ssl = False
+    ca_cert = None
+
+    try:
+        options, arguments = getopt.getopt(sys.argv[1:], SHORT_OPTIONS, LONG_OPTIONS)
+    except getopt.GetoptError:
+        sys.stderr.write("Error: Can't parse arguments\n")
+        sys.exit(UNKNOWN)
+
+    for opt, arg in options:
+        if opt in ("-h", "--help"):
+            usage()
+            sys.exit(0)
+        elif opt in ("-H", "--host"):
+            host = arg
+        elif opt in ("-p", "--port"):
+            try:
+                port = int(arg)
+            except ValueError:
+                sys.stderr.write("Error: Can't convert %s to a number\n" % (arg, ))
+                sys.exit(UNKNOWN)
+
+            if port <= 0 or port > 65535:
+                sys.stderr.write("Error: Invalid port %u\n" % (port, ))
+                sys.exit(UNKNOWN)
+        elif opt in ("-C", "--check-cluster"):
+            check_cluster = True
+        elif opt in ("-s", "--ssl"):
+            use_ssl = True
+        elif opt in ("-c", "--ca-cert"):
+            ca_cert = arg
+
+    if check_cluster:
+        status = get_cluster_health(host, port, use_ssl, ca_cert)
+        state, message = parse_cluster_health(status)
+        print(message)
+        sys.exit(state)
+    sys.exit(UNKNOWN)
+
